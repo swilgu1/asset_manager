@@ -1,0 +1,4 @@
+ACCOUNT,ASSET,CLASS,TARGET
+Roth IRA,AVUV,US Markets,0.5
+Roth IRA,AVDV,Developed Markets,0.3
+Roth IRA,AVES,Emerging Markets,0.2
