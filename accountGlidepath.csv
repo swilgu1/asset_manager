@@ -1,0 +1,5 @@
+ACCOUNT,TYPE,FUND,ASSET,STARTING,ENDING
+401(k),US Equities,AVUS,US Large Blend,0.25,0.25
+401(k),US Equities,AVUV,US Small Value,0.25,0.25
+401(k),Intl Equities,AVDV,Intl Small Value,0.25,0.25
+401(k),Emerging Markets,AVES,Emerging Markets,0.25,0.25

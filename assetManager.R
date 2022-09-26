@@ -1,335 +1,498 @@
+#########################
+### ASSET MANAGER 2.0 ###
+#########################
+
+###################
+### DATA IMPORT ###
+###################
 
 ##### LOADING LIBRARIES #####
 
-library(shiny)
 library(tidyverse)
 library(quantmod)
-library(knitr)
+library(treemapify)
+library(highcharter) 
 library(plotly)
 library(scales)
-library(paletteer)
 library(markdown)
 library(shinycssloaders)
+library(lubridate)
+library(shinydashboard)
 
-data <- read_csv("FinancialActivity.csv") %>%
-  mutate(COST = round(AMOUNT*PRICE, digits = 2)) %>%
-  mutate(DATE = as.Date(DATE, format = "%m/%d/%Y"))
+##### DATA ENTRY FOR GLIDEPATH #####
 
-accountChoices <- c("Portfolio", unique(read_csv("accountAssetTargets.csv")$ACCOUNT))
-assetChoices <- unique(read_csv("accountAssetTargets.csv")$ASSET)
+birthday <- "1993-04-15"
 
-##### UI #####
+##### COLOR PALETTE #####
+
+colorPal <- c("#031D44", "#04395E", "#70A288", "#A5AD87", 
+              "#DAB785", "#D5896F", "#AE5132", "#3A6E73", "#D8A07A")
+
+##### LOADING DATA #####
+
+setwd("~/R Projects/asset_manager/")
+rawData <- read_csv("financialActivity.csv") %>%
+  mutate(AMOUNT = ifelse(TRANSACTION == "SELL", AMOUNT*-1, AMOUNT),
+         COST = round(AMOUNT*PRICE, digits = 4),
+         DATE = as.Date(DATE, format = "%m/%d/%Y"),
+         LOT_DATE = as.Date(LOT_DATE, format = "%m/%d/%Y"))
+
+sellLots <- rawData %>%
+  filter(TRANSACTION == "SELL") %>%
+  select(ACCOUNT, FUND, DATE, LOT_DATE, AMOUNT) %>%
+  rename(SELL_DATE = DATE, 
+         DATE = LOT_DATE,
+         SELL_AMOUNT = AMOUNT) %>%
+  left_join(rawData) %>%
+  mutate(SELL_COST = round(SELL_AMOUNT*PRICE, digits = 4)) %>%
+  select(ACCOUNT, FUND, SELL_DATE, SELL_COST) %>%
+  rename(DATE = SELL_DATE)
+
+data <- rawData %>%
+  left_join(sellLots) %>%
+  mutate(COST = ifelse(TRANSACTION == "SELL", SELL_COST, COST)) %>%
+  select(-SELL_COST, -LOT_DATE)
+
+# ADJUSTED TARGETS BASED ON AGE
+age <- round(time_length(difftime(Sys.Date(), 
+                                  as.Date(birthday)), 
+                         unit = "years"), digits = 0)
+years <- ifelse(age-(55-25) < 0, 0, age-(55-25))
+daysInvested <- data.frame(DATE = seq(min(data$DATE), Sys.Date(), by="days"))
+
+glidePath <- read_csv("accountGlidepath.csv") %>%
+  mutate(DIFF = ENDING - STARTING,
+         ADJ = ((DIFF/25)*years),
+         TARGET = STARTING+ADJ)
+
+targetsAdj <- glidePath %>%
+  select(ACCOUNT, FUND, TYPE, ASSET, TARGET) %>%
+  filter(TARGET > 0)
+
+accountWeight <- data %>%
+  mutate(TOTAL = sum(COST)) %>%
+  group_by(ACCOUNT) %>%
+  summarise(ACCOUNT_WEIGHT = sum(COST)/TOTAL) %>%
+  distinct()
+
+accountTargets <- targetsAdj
+
+portfolioTargets <- accountTargets %>%
+  left_join(accountWeight) %>%
+  mutate(WEIGHT = TARGET*ACCOUNT_WEIGHT) %>%
+  group_by(FUND, TYPE, ASSET) %>%
+  summarise(TARGET = sum(WEIGHT))
+
+# SAVING CURRENT ALLOCATIONS FOR RECORDS
+write.csv(accountTargets, 
+          paste0(getwd(),"/Targets by Age/accountAssetTargets_adjusted_", age, ".csv"), 
+          row.names = F)
+
+# CREATING ASSETS REFERENCE TABLE
+accountChoices <- c("Portfolio", unique(read_csv(paste0(getwd(),"/Targets by Age/accountAssetTargets_adjusted_", age, ".csv"))$ACCOUNT))
+typeChoices <- unique(read_csv(paste0(getwd(),"/Targets by Age/accountAssetTargets_adjusted_", age, ".csv"))$TYPE)
+assetChoices <- unique(read_csv(paste0(getwd(),"/Targets by Age/accountAssetTargets_adjusted_", age, ".csv"))$ASSET)
+
+assetType <- glidePath %>%
+  select(TYPE, ASSET, FUND) %>%
+  distinct() %>%
+  mutate(TYPE = factor(TYPE, levels = c("US Equities",
+                                        "Intl Equities",
+                                        "Emerging Markets",
+                                        "REITs")),
+         ASSET = factor(ASSET, levels = c("US Large Blend",
+                                          "US Small Value",
+                                          "Intl Large Blend",
+                                          "Intl Small Value",
+                                          "Emerging Markets",
+                                          "REITs")),
+         FUND = factor(FUND, levels = c("AVUS",
+                                        "AVUV",
+                                        "DFAX",
+                                        "AVDV",
+                                        "AVES",
+                                        "DFAR"))) %>%
+  arrange(TYPE, ASSET, FUND)
+
+assetType$COLOR <- colorPal[1:nrow(assetType)]
+assetType$COLOR <- factor(assetType$COLOR, levels = colorPal[1:nrow(assetType)])
+
+# GET FUND PRICES & TIME SERIES
+funds <- unique(data$FUND)
+fundPrices_list <- list()
+fundSeries_list <- list()
+for(i in 1:length(funds)){
+  symbol <- funds[i]
+  quote <- getQuote(symbol)
+  price <- quote$Last
+  
+  fundPrice <- cbind.data.frame(FUND = symbol, 
+                                CURRENT_PRICE = round(price, digits = 2))
+  fundPrices_list[[i]] <- fundPrice
+  
+  ts <- daysInvested %>%
+    left_join(getSymbols(symbol, auto.assign = F) %>%
+                as_tibble(rownames = "DATE") %>%
+                select(DATE, contains(".Close")) %>%
+                setNames(., c("DATE", "CLOSE")) %>%
+                mutate(DATE = as.Date(DATE)))
+  
+  ts[1,2] <- ifelse(is.na(first(ts$CLOSE)) == T, 
+                    first(ts$CLOSE[is.na(ts$CLOSE) == F]),
+                    first(ts$CLOSE))
+  
+  ts <- ts %>%
+    mutate(CLOSE = na.locf(CLOSE),
+           FUND = symbol)
+  
+  fundSeries_list[[i]] <- ts
+}
+
+fundPrices <- bind_rows(fundPrices_list) %>%
+  mutate(DAY = "Today")
+fundSeries <- bind_rows(fundSeries_list)
+
+dayPrices <- fundSeries %>%
+  filter(DATE == Sys.Date() %m-% days(1)) %>%
+  rename(LAST_PRICE = CLOSE) %>%
+  select(-DATE) %>%
+  left_join(fundPrices) %>%
+  mutate(TODAY_CHANGE = (CURRENT_PRICE - LAST_PRICE)/LAST_PRICE) %>%
+  left_join(assetType) %>%
+  arrange(TYPE, ASSET)
+
+dayMessage_list <- list()
+for(i in 1:nrow(dayPrices)){
+  row <- dayPrices[i,]
+  q <- paste0(row$FUND, ": ", "$", row$CURRENT_PRICE, " (", 
+              percent(row$TODAY_CHANGE, accuracy = .01), ")")
+  
+  dayMessage_list[[i]] <- q
+}
+
+
+dayMessage <- paste(dayMessage_list, collapse = " | ")
+
+#################
+### DATA PREP ###
+#################
+
+##### CONTRIBUTION CALCULATOR, REBALANCE, TREEMAP, DEVIATION DATA #####
+
+accountSummary <- data %>%
+  group_by(ACCOUNT, FUND) %>%
+  summarise(AMOUNT = sum(AMOUNT),
+            COST_BASIS = sum(COST)) %>%
+  left_join(fundPrices) %>%
+  left_join(accountTargets) %>%
+  group_by(ACCOUNT) %>%
+  mutate(MARKET_VAL = AMOUNT*CURRENT_PRICE,
+         ACTUAL = round(MARKET_VAL/sum(MARKET_VAL), digits = 4),
+         TARGET_VAL = TARGET*sum(MARKET_VAL),
+         VAL_DEV = MARKET_VAL-TARGET_VAL,
+         REL_DEV = VAL_DEV/TARGET_VAL,
+         REBALANCE = -1*floor(VAL_DEV/CURRENT_PRICE))
+
+portfolioSummary <- data %>%
+  group_by(FUND) %>%
+  summarise(AMOUNT = sum(AMOUNT),
+            COST_BASIS = sum(COST)) %>%
+  left_join(fundPrices) %>%
+  left_join(portfolioTargets) %>%
+  mutate(MARKET_VAL = AMOUNT*CURRENT_PRICE,
+         ACTUAL = round(MARKET_VAL/sum(MARKET_VAL), digits = 4),
+         TARGET_VAL = TARGET*sum(MARKET_VAL),
+         VAL_DEV = MARKET_VAL-TARGET_VAL,
+         REL_DEV = VAL_DEV/TARGET_VAL,
+         REBALANCE = -1*floor(VAL_DEV/CURRENT_PRICE),
+         ACCOUNT = "Portfolio") 
+
+fullSummary <- bind_rows(accountSummary, portfolioSummary) %>%
+  mutate(LABEL = paste0(ASSET, "\n(", FUND,"; ", percent(ACTUAL,
+                                                         accuracy = .1), ")"),
+         TYPE = factor(TYPE, levels = levels(assetType$TYPE)),
+         ASSET = factor(ASSET, levels = levels(assetType$ASSET)))
+
+##### PORTFOLIO GROWTH DATA #####
+
+accountGrowth_list <- list()
+for(i in 1:length(unique(data$ACCOUNT))){
+  accountSeries <- data %>%
+    filter(ACCOUNT == unique(data$ACCOUNT)[i])
+  
+  fundGrowth_list <- list()
+  for(k in 1:length(unique(accountSeries$FUND))){
+    myShares <- accountSeries %>%
+      filter(FUND == unique(accountSeries$FUND)[k])
+    
+    mySeries <- fundSeries %>%
+      filter(FUND == unique(accountSeries$FUND)[k]) %>%
+      left_join(myShares) %>%
+      filter(DATE >= min(myShares$DATE)) %>%
+      arrange(DATE) %>%
+      select(DATE, ACCOUNT, FUND, ASSET, AMOUNT, COST, CLOSE) %>%
+      mutate(ACCOUNT = na.locf(ACCOUNT),
+             FUND = na.locf(FUND),
+             ASSET = na.locf(ASSET),
+             AMOUNT = ifelse(is.na(AMOUNT) == T, 0, AMOUNT),
+             COST = ifelse(is.na(COST) == T, 0, COST)) %>%
+      group_by(DATE) %>%
+      mutate(AMOUNT = sum(AMOUNT),
+             COST = sum(COST)) %>%
+      ungroup() %>%
+      distinct() %>%
+      mutate(SHARES = cumsum(AMOUNT),
+             COST_BASIS = cumsum(COST),
+             MARKET_VALUE = SHARES*CLOSE) %>%
+      select(DATE, ACCOUNT, FUND, ASSET, COST_BASIS, MARKET_VALUE)
+    
+    fundGrowth_list[[k]] <- mySeries
+  }
+  accountGrowth_list[[i]] <- bind_rows(fundGrowth_list)
+}
+
+growthData <- bind_rows(accountGrowth_list) %>%
+  distinct() %>%
+  mutate(wday = weekdays(DATE)) %>%
+  filter(wday %in% c('Monday','Tuesday', 'Wednesday', 'Thursday', 'Friday')) %>%
+  select(-wday)
+
+accountGrowth <- growthData %>%
+  group_by(DATE, ACCOUNT) %>%
+  summarise(COST_BASIS = sum(COST_BASIS),
+            MARKET_VALUE = sum(MARKET_VALUE))
+
+portfolioGrowth <- growthData %>%
+  select(-ACCOUNT) %>%
+  group_by(DATE, FUND) %>%
+  summarise(COST_BASIS = sum(COST_BASIS),
+            MARKET_VALUE = sum(MARKET_VALUE)) %>%
+  mutate(ACCOUNT = "Portfolio")
+
+fullGrowth <- bind_rows(accountGrowth,
+                        portfolioGrowth)
+
+fundGrowth <- growthData %>%
+  group_by(DATE, FUND) %>%
+  summarise(COST_BASIS = sum(COST_BASIS),
+            MARKET_VALUE = sum(MARKET_VALUE))
+
+###################
+### GENERATE UI ###
+###################
 
 ui <- fluidPage(
   
-  
-  titlePanel("Asset Manager"),
+  titlePanel(span(tagList(icon("bolt"), "Asset Manager"))),
   
   sidebarLayout(
     sidebarPanel(
       helpText("Visualize account assets,
                track growth, and direct new
                contributions."),
+      hr(),
       
-      selectInput("account", 
+      h4(span(tagList(icon("dollar-sign"), "Today's Prices"))),
+      HTML(paste0('<marquee behavior="scroll" direction="left">', dayMessage,'</marquee>')),
+      hr(),
+      
+      h4(span(tagList(icon("folder"), "Account Selection"))),
+      selectInput("account",
                   label = "Choose an account to view:",
                   choices = accountChoices,
                   selected = "Portfolio"),
+      hr(),
       
-      h4("Contribution Calculator"),
-      
+      h4(span(tagList(icon("money-bill"), "Contribution Calculator"))),
       numericInput("contr",
                    label = "Enter new contribution:",
                    value = 0),
       actionButton("calcContr",
                    label = "Calculate"),
-      
       htmlOutput("contrMessage1"),
       htmlOutput("contrMessage2"),
+      hr(),
       
-      br(),
-      br(),
-      
-      h4("Add Shares"),
-      
-      selectInput("enterAsset",
-                  label = "Choose asset to purchase:",
-                  choices = assetChoices),
-      numericInput("enterShares",
-                   label = "Enter number of shares:",
-                   value = 0),
-      numericInput("enterPrice",
-                   label = "Enter share price:",
-                   value = 0),
-      actionButton("addShare",
-                   label = "Add shares"),
-      htmlOutput("saveData")
+      h4(span(tagList(icon("wrench"), "Rebalance Calculator"))),
+      actionButton("rebalance",
+                   label = "Calculate"),
+      htmlOutput("rebalMessage1"),
+      htmlOutput("rebalMessage2"),
+      htmlOutput("rebalMessage3")
     ),
+    
     mainPanel(
-      h4("Account Summary"),
-      htmlOutput("acctSumm"),
-      htmlOutput("acctRebalance"),
-      h4("Asset Allocation"),
-      withSpinner(plotlyOutput(outputId = "assetAllo")),
-      h4("Growth of Assets"),
+      h3("Account Summary", align = "center"),
+      h4(span(tagList(icon("chart-pie"), "Asset Allocation"))),
+      hr(),
+      withSpinner(plotlyOutput(outputId = "treemap")),
+      h4(span(tagList(icon("chart-bar"), "Asset Drift"))),
+      hr(),
+      withSpinner(plotlyOutput(outputId = "driftChart")),
+      h4(span(tagList(icon("chart-line"), "Recent Performance & Asset Growth"))),
+      hr(),
       withSpinner(plotlyOutput(outputId = "growthChart"))
     )
-  )
+  ),
+  tags$head(tags$style(HTML('* {font-family: "Verdana"};')))
 )
 
 withSpinner(plotOutput("my_plot"))
 plotOutput("my_plot") %>% withSpinner()
-server <- function(input, output){
+
+#######################
+### GENERATE SERVER ###
+#######################
+
+server <- function(input, output, session){
   
-  ##### LOADING DATA #####
-  
-  targets <- read_csv("accountAssetTargets.csv")
-  assetTypes <- targets %>%
-    select(ASSET, CLASS) %>%
-    distinct()
-  
-  daysInvested <- data.frame(DATE = seq(min(data$DATE), Sys.Date(), by="days"))
-  
-  colorPal <- c(as.vector(paletteer_dynamic("cartography::blue.pal",1)),
-                as.vector(paletteer_dynamic("cartography::red.pal",1)),
-                as.vector(paletteer_dynamic("cartography::green.pal",1)),
-                as.vector(paletteer_dynamic("cartography::sand.pal",1)),
-                as.vector(paletteer_dynamic("cartography::purple.pal",1)),
-                as.vector(paletteer_dynamic("cartography::orange.pal",1)),
-                as.vector(paletteer_dynamic("cartography::brown.pal",1)))
-  
-  acc.port.Cols <- paletteer_dynamic("cartography::blue.pal",length(unique(targets$ASSET)))
-  
-  palVector <- c("cartography::red.pal", "cartography::green.pal", "cartography::sand.pal", "cartography::purple.pal")
-  
-  acctBlends <- list(acc.port.Cols)
-  for(i in 1:length(unique(data$ACCOUNT))){
-    acctBlends[[i+1]] <- paletteer_dynamic(palVector[i], 
-                                         length(unique(targets$ASSET[targets$ACCOUNT == unique(data$ACCOUNT)[i]])))
-  }
-  
-  names(acctBlends) <- c("Portfolio", unique(targets$ACCOUNT))
-  
-  ##### PREPPING DATA #####
-  
-  accountAssetDatList <- list()
-  accountAssetTimeSeries <- list()
-  
-  for(i in 1:length(unique(targets$ACCOUNT))){
+  output$treemap <- renderHighchart({
     
-    account <- data %>%
-      subset(ACCOUNT == unique(targets$ACCOUNT)[i])
-    accountAssets <- targets %>%
-      subset(ACCOUNT == unique(targets$ACCOUNT)[i])
+    visDat <- fullSummary %>%
+      subset(ACCOUNT == input$account) %>%
+      ungroup() %>%
+      select(ACCOUNT, TYPE, ASSET, LABEL, MARKET_VAL) %>%
+      left_join(assetType)
     
-    assetDatList <- list()
-    assetTimeSeries <- list()
+    vis <- plot_ly(
+      type="treemap",
+      labels=visDat$LABEL,
+      parents = visDat$ACCOUNT,
+      values = visDat$MARKET_VAL,
+      marker=list(colors=c(visDat$COLOR))
+    )
     
-    for(k in 1:length(unique(accountAssets$ASSET))){
-      symbol <- unique(accountAssets$ASSET)[k]
-      
-      # GETTING QUOTE
-      quote <- getQuote(symbol)
-      
-      price <- quote$Last
-      
-      assetDat <- cbind.data.frame(ASSET = symbol, 
-                                   CURRENT_PRICE = round(price, digits = 2))
-      
-      assetDatList[[k]] <- assetDat
-      
-      # GETTING PAST CLOSING PRICES
-      
-      ts <- daysInvested %>%
-        left_join(getSymbols(symbol, auto.assign = F) %>%
-                    as_tibble(rownames = "DATE") %>%
-                    select(DATE, contains(".Close")) %>%
-                    setNames(., c("DATE", "CLOSE")) %>%
-                    mutate(DATE = as.Date(DATE))) %>%
-        mutate(CLOSE = na.locf(CLOSE))
-      
-      myShares <- account %>%
-        select(-ACCOUNT) %>%
-        filter(ASSET == symbol) %>%
-        arrange(desc(DATE))
-      
-      myData <- ts %>%
-        left_join(myShares) %>%
-        filter(DATE >= min(myShares$DATE)) %>%
-        arrange(DATE) %>%
-        mutate(ASSET = na.locf(ASSET),
-               AMOUNT = ifelse(is.na(AMOUNT) == T, 0, AMOUNT),
-               COST = ifelse(is.na(COST) == T, 0, COST)) %>%
-        group_by(DATE) %>%
-        mutate(AMOUNT = sum(AMOUNT),
-               COST = sum(COST)) %>%
-        ungroup() %>%
-        select(-PRICE) %>%
-        distinct() %>%
-        mutate(CUMULATIVE_AMOUNT = cumsum(AMOUNT),
-               CUMULATIVE_COST = cumsum(COST),
-               CUMULATIVE_VALUE = CUMULATIVE_AMOUNT*CLOSE,
-               ACCOUNT = unique(targets$ACCOUNT)[i]) %>%
-        select(DATE, ACCOUNT, ASSET, CUMULATIVE_COST, CUMULATIVE_VALUE)
-      
-      assetTimeSeries[[k]] <- myData
-    }
+    vis
+  })
+  
+  output$driftChart <- renderPlotly({
     
-    accountAssetDatList[[i]] <- bind_rows(assetDatList)
-    accountAssetTimeSeries[[i]] <- bind_rows(assetTimeSeries)
-  }
-  
-  assetPrices <- bind_rows(accountAssetDatList) %>%
-    distinct()
-  
-  accountAssetGrowth <- bind_rows(accountAssetTimeSeries) %>%
-    setNames(., c("DATE", "ACCOUNT", "ASSET", "COST", "VALUE"))
-  
-  accountGrowth <- daysInvested %>%
-    left_join(accountAssetGrowth) %>%
-    group_by(ACCOUNT, DATE) %>%
-    summarise(COST = sum(COST),
-              VALUE = sum(VALUE)) %>%
-    mutate(wday = weekdays(DATE)) %>%
-    filter(wday %in% c('Monday','Tuesday', 'Wednesday', 'Thursday', 'Friday'))
-  
-  portfolioGrowth <- daysInvested %>%
-    left_join(accountGrowth) %>%
-    group_by(DATE) %>%
-    summarise(COST = sum(COST),
-              VALUE = sum(VALUE)) %>%
-    mutate(ACCOUNT = "Portfolio") %>%
-    mutate(wday = weekdays(DATE)) %>%
-    filter(wday %in% c('Monday','Tuesday', 'Wednesday', 'Thursday', 'Friday'))
-  
-  growthData <- accountGrowth %>%
-    bind_rows(portfolioGrowth)
-  
-  ##### SUMMARIZING CURRENT VALUE #####
-  
-  portfolioSummary <- data %>%
-    group_by(ACCOUNT, ASSET) %>%
-    summarise(AMOUNT = sum(AMOUNT),
-              COST_BASIS = round(sum(COST), digits = 2)) %>%
-    full_join(targets) %>%
-    mutate_if(is.numeric , replace_na, replace = 0) %>%
-    left_join(assetPrices) %>%
-    mutate(ACTUAL_VALUE = round(AMOUNT*CURRENT_PRICE, digits = 2)) %>%
-    group_by(ACCOUNT) %>%
-    mutate(TARGET_VALUE = round(TARGET*sum(ACTUAL_VALUE), digits = 4),
-           ACTUAL = round(ACTUAL_VALUE/sum(ACTUAL_VALUE), digits = 4)) %>%
-    mutate_if(is.numeric , replace_na, replace = 0) %>%
-    group_by(ACCOUNT) %>%
-    arrange(desc(ACTUAL), .by_group = T) %>%
-    mutate(ASSET = fct_inorder(ASSET)) %>%
-    select(ACCOUNT, ASSET, AMOUNT, COST_BASIS, TARGET, TARGET_VALUE,
-           ACTUAL, ACTUAL_VALUE) %>%
-    mutate(DEVIATION = round((ACTUAL_VALUE - TARGET_VALUE)/TARGET_VALUE, digits = 4))
-  
-  fullSummary <- portfolioSummary %>%
-    select(-ACCOUNT) %>%
-    group_by(ASSET) %>%
-    summarise(AMOUNT = sum(AMOUNT),
-              COST_BASIS = round(sum(COST_BASIS), digits = 2),
-              TARGET_VALUE = sum(TARGET_VALUE),
-              ACTUAL_VALUE = round(sum(ACTUAL_VALUE), digits = 2)) %>%
-    mutate(TARGET = round(TARGET_VALUE/sum(TARGET_VALUE), digits = 2),
-           ACTUAL = ACTUAL_VALUE/sum(ACTUAL_VALUE)) %>%
-    mutate_if(is.numeric , replace_na, replace = 0) %>%
-    arrange(desc(ACTUAL), .by_group = T) %>%
-    mutate(ASSET = fct_inorder(ASSET),
-           ACCOUNT = "Portfolio") %>%
-    select(ACCOUNT, ASSET, AMOUNT, COST_BASIS, TARGET, TARGET_VALUE,
-           ACTUAL, ACTUAL_VALUE) %>%
-    mutate(DEVIATION = round((ACTUAL_VALUE - TARGET_VALUE)/TARGET_VALUE, digits = 4))
-  
-  output$growthChart <- renderPlotly({
+    visDat <- fullSummary %>%
+      subset(ACCOUNT == input$account) %>%
+      left_join(assetType) %>%
+      arrange(TYPE, ASSET)
     
-    col <- acctBlends[[input$account]]
+    visDat$TITLE <- "Asset % Drift from Targets"
     
-    ggplotly(growthData %>%
-               subset(ACCOUNT == input$account) %>%
-               select(DATE, COST) %>%
-               mutate(LINE = "Cost Basis") %>%
-               rename(VALUE = COST) %>%
-               bind_rows(growthData %>%
-                           subset(ACCOUNT == input$account) %>%
-                           select(DATE, VALUE) %>%
-                           mutate(LINE = "Market Value")) %>%
-               mutate(LINE = factor(LINE, levels = c("Market Value",
-                                                     "Cost Basis"))) %>%
-               ggplot(aes(x = DATE, y = VALUE, group = LINE)) +
-               geom_line(aes(colour = LINE, linetype = LINE), size = 1) +
-               scale_color_manual(values=c(rev(col)[1], "grey51")) +
-               scale_linetype_manual(values=c("Market Value" = "solid", "Cost Basis" =  "solid"),
-                                     guide = guide_legend(override.aes = list(size = 2))) +
-               scale_y_continuous(labels = scales::dollar_format(scale = .001, suffix = "K")) +
-               scale_x_date(date_labels="%b-%y",date_breaks  ="1 month") +
-               theme_minimal() +
-               theme(legend.position = "bottom",
-                     axis.title.x = element_blank(),
-                     axis.title.y = element_blank(),
-                     legend.title = element_blank())) %>% layout(legend = list(orientation = 'h'))
+    ub <- ifelse(max(visDat$REL_DEV) >= .08, max(visDat$REL_DEV)+.02, .1)
+    lb <- ifelse(min(visDat$REL_DEV) <= -.08, min(visDat$REL_DEV)-.02, -.1)
+    
+    vis <- ggplotly(visDat %>%
+                      ggplot(aes(x = ASSET, y = REL_DEV, fill = ASSET)) +
+                      geom_bar(stat = "identity", position = "dodge", width = .75) +
+                      geom_text(aes(label = paste0(FUND, "\n",
+                                                   "(", percent(REL_DEV, accuracy = .01), ")"),
+                                    y = REL_DEV+.008*sign(REL_DEV)),
+                                size = 3) +
+                      theme_minimal() +
+                      scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                                         limits = c(lb,ub)) +
+                      scale_fill_manual(values = as.character(visDat$COLOR)) +
+                      ylab(NULL) +
+                      xlab(NULL) +
+                      theme(legend.position = "none",
+                            panel.grid.major.x = element_blank(),
+                            panel.grid.major.y = element_blank(),
+                            panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+                      geom_hline(yintercept = 0) +
+                      geom_hline(yintercept = .05, linetype = 'dotted', alpha = .25) +
+                      geom_hline(yintercept = -.05, linetype = 'dotted', alpha = .25) +
+                      facet_wrap(~TITLE))
+    
+    vis
     
   })
   
-  output$assetAllo <- renderPlotly({
+  output$growthChart <- renderPlotly({
     
-    if (input$account == "Portfolio") {
-      bd <- portfolioSummary %>%
-        select(-ACCOUNT) %>%
-        group_by(ASSET) %>%
-        summarise(AMOUNT = sum(AMOUNT),
-                  TARGET_VALUE = sum(TARGET_VALUE),
-                  ACTUAL_VALUE = sum(ACTUAL_VALUE)) %>%
-        mutate(TARGET = TARGET_VALUE/sum(TARGET_VALUE),
-               ACTUAL = ACTUAL_VALUE/sum(ACTUAL_VALUE)) %>%
-        mutate_if(is.numeric , replace_na, replace = 0) %>%
-        arrange(desc(ACTUAL), .by_group = T) %>%
-        mutate(ASSET = fct_inorder(ASSET),
-               ACCOUNT = "Portfolio") %>%
-        select(ACCOUNT, ASSET, AMOUNT, TARGET, TARGET_VALUE,
-               ACTUAL, ACTUAL_VALUE) %>%
-        mutate(DEVIATION = round((ACTUAL_VALUE - TARGET_VALUE)/TARGET_VALUE, digits = 4)) %>%
-        left_join(assetTypes) %>%
-        mutate(CLASS = fct_inorder(CLASS))
-      
-      ggplotly(ggplot(bd, aes(x = CLASS, y = ACTUAL_VALUE, fill = interaction(ASSET, CLASS))) +
-                 geom_bar(position = "stack", stat = "identity", width = .75) +
-                 geom_text(data = subset(bd, ACTUAL > .05), aes(label = paste0(ASSET, "\n",
-                                                                               percent(ACTUAL, accuracy = .01))), 
-                           position = position_stack(vjust = .5)) +
-                 theme_minimal() +
-                 theme(legend.position = "none",
-                       axis.title.x = element_blank(),
-                       axis.title.y = element_blank()) +
-                 scale_y_continuous(labels=dollar_format(prefix="$")) +
-                 scale_fill_manual(values=rev(acc.port.Cols)))
+    acctGrowth <- fullGrowth %>%
+      subset(ACCOUNT == input$account) %>%
+      select(DATE, ACCOUNT, COST_BASIS, MARKET_VALUE) %>%
+      rename(`Cost Basis` = COST_BASIS,
+             `Market Value` = MARKET_VALUE) %>%
+      pivot_longer(c(-DATE, -ACCOUNT), names_to = "LINE", values_to = "VALUE") %>%
+      group_by(DATE, LINE) %>%
+      summarise(VALUE = sum(VALUE))
+    
+    end_mv <- acctGrowth$VALUE[acctGrowth$LINE == "Market Value" &
+                                 acctGrowth$DATE == max(acctGrowth$DATE)]
+    end_cb <- acctGrowth$VALUE[acctGrowth$LINE == "Cost Basis" &
+                                 acctGrowth$DATE == max(acctGrowth$DATE)]
+    performance <- percent((end_mv-end_cb)/end_cb, accuracy = .1)
+    
+    acctGrowth$TITLE <- paste0("Cost Basis vs. Market Value (", performance, " Overall)")
+    
+    if(input$account == "Portfolio"){
+      fundSelect <- growthData %>%
+        ungroup() %>%
+        select(FUND) %>% distinct()
     } else {
-      bd <- portfolioSummary %>%
-        filter(ACCOUNT == input$account) %>%
-        left_join(assetTypes) %>%
-        mutate(CLASS = fct_inorder(CLASS)) %>%
-        arrange(desc(ACTUAL)) %>%
-        mutate(ASSET = fct_inorder(ASSET))
-      
-      ggplotly(ggplot(bd, aes(x = CLASS, y = ACTUAL_VALUE, fill = ASSET)) +
-                 geom_bar(position = "stack", stat = "identity", width = .75) +
-                 geom_text(data = subset(bd, ACTUAL > .05), aes(label = paste0(ASSET, "\n",
-                                                                               percent(ACTUAL, accuracy = .01))), 
-                           position = position_stack(vjust = .5)) +
-                 theme_minimal() +
-                 theme(legend.position = "none",
-                       axis.title.x = element_blank(),
-                       axis.title.y = element_blank()) +
-                 scale_y_continuous(labels=dollar_format(prefix="$")) +
-                 scale_fill_manual(values=rev(acctBlends[[input$account]])))
+      fundSelect <- growthData %>%
+        subset(ACCOUNT == input$account) %>%
+        ungroup() %>%
+        select(FUND) %>% distinct()
     }
+    
+    fundGrowth_1m <- fundSeries %>%
+      filter(FUND %in% fundSelect$FUND & DATE >= (Sys.Date() %m-% months(1))) %>%
+      group_by(FUND) %>%
+      left_join(assetType) %>%
+      mutate(START = CLOSE[DATE == min(DATE)],
+             CHANGE = round((CLOSE-START)/START, digits = 4)) %>%
+      mutate(LABEL = paste0(FUND, "\n(", percent(CHANGE[DATE == max(DATE)], 
+                                                 accuracy = .1), ")")) %>%
+      arrange(DATE, TYPE, ASSET) %>%
+      mutate(FUND = factor(FUND, levels = levels(assetType$FUND))) %>%
+      mutate(wday = weekdays(DATE)) %>%
+      filter(wday %in% c('Monday','Tuesday', 'Wednesday', 'Thursday', 'Friday'))
+    
+    fundGrowth_1m$LABEL <- factor(fundGrowth_1m$LABEL, 
+                                  levels = unique(fundGrowth_1m$LABEL))
+    
+    vis1 <- ggplotly(fundGrowth_1m %>%
+                       ggplot(aes(x = DATE, y = CHANGE, group = FUND)) +
+                       geom_line(aes(colour = FUND), size = 1.25) +
+                       scale_color_manual(values = as.character(unique(fundGrowth_1m$COLOR))) +
+                       ylab(NULL) +
+                       xlab(NULL) +
+                       theme_minimal() +
+                       theme(legend.position = "none",
+                             panel.grid.major = element_blank(), 
+                             panel.grid.minor = element_blank(),
+                             panel.background = element_blank(),
+                             axis.text.x = element_blank(),
+                             axis.ticks = element_blank(),
+                             panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+                       scale_y_continuous(labels = scales::percent_format(accuracy = .01)) +
+                       geom_hline(yintercept = 0, linetype = "dotted", size = .75, alpha = .25) +
+                       facet_wrap(~LABEL, nrow = 1)) %>%
+      layout(showlegend = FALSE)
+    
+    vis2 <- ggplotly(acctGrowth %>%
+                       ggplot(aes(x = DATE, y = VALUE, group = LINE)) +
+                       geom_line(aes(colour = LINE), size = 1) +
+                       scale_color_manual(values=c("black", "grey51"),
+                                          guide = guide_legend(title = NULL)) +
+                       scale_y_continuous(labels = scales::dollar_format(scale = .001, suffix = "K")) +
+                       scale_x_date(date_labels="%b-%y") +
+                       theme_minimal() +
+                       xlab(NULL) +
+                       ylab(NULL) +
+                       theme(panel.grid.major = element_blank(), 
+                             panel.grid.minor = element_blank(),
+                             panel.background = element_blank(),
+                             panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+                       facet_wrap(~TITLE)) %>%
+      layout(showlegend = FALSE)
+    
+    plotly::subplot(vis1, vis2, nrows=2,
+                    margin = 0.05, heights = c(0.3, 0.7))
+    
   })
   
   acct <- reactive(input$account)
   
-  displayText <- eventReactive(input$calcContr, {
+  displayText1 <- eventReactive(input$calcContr, {
     output$contrMessage1 <- renderUI({input$calcContr;
       account <- acct()
       amount <- input$contr
@@ -343,172 +506,123 @@ server <- function(input, output){
       account <- acct()
       amount <- input$contr
       
-      if (input$account == "Portfolio") {
-        accountDat <- portfolioSummary
+      calcData <- fullSummary %>%
+        filter(ACCOUNT == input$account)
+      
+      targetTotal <- amount+sum(calcData$MARKET_VAL)
+      
+      calcOutput <- calcData %>%
+        mutate(NEW_VAL = TARGET*targetTotal,
+               DIFFERENCE = case_when(NEW_VAL-MARKET_VAL < 0 ~ 0,
+                                      TRUE ~ NEW_VAL-MARKET_VAL),
+               ADJ_DIFFERENCE = (DIFFERENCE/sum(DIFFERENCE))*amount,
+               BUY_SHARES = floor(ADJ_DIFFERENCE/CURRENT_PRICE)) %>%
+        select(FUND, BUY_SHARES) %>%
+        filter(BUY_SHARES > 0) %>%
+        left_join(assetType) %>%
+        arrange(TYPE, ASSET)
+      
+      text_list <- list()
+      for(i in 1:length(unique(calcOutput$FUND))){
+        fund <- calcOutput %>%
+          filter(FUND == unique(calcOutput$FUND)[i])
         
-        targetTotal <- amount+sum(accountDat$ACTUAL_VALUE)
+        action <- paste0("Buy ", fund$BUY_SHARES, " shares of ",
+                         fund$FUND, ".")
         
-        contrAllo <- suppressMessages(accountDat %>%
-                                        select(-ACCOUNT) %>%
-                                        group_by(ASSET) %>%
-                                        summarise(AMOUNT = sum(AMOUNT),
-                                                  TARGET_VALUE = sum(TARGET_VALUE),
-                                                  ACTUAL_VALUE = sum(ACTUAL_VALUE)) %>%
-                                        mutate(TARGET = TARGET_VALUE/sum(TARGET_VALUE),
-                                               ACTUAL = ACTUAL_VALUE/sum(ACTUAL_VALUE)) %>%
-                                        mutate_if(is.numeric , replace_na, replace = 0) %>%
-                                        left_join(assetPrices) %>%
-                                        mutate(NEW_VALUE = targetTotal*TARGET,
-                                               DIFFERENCE = case_when(NEW_VALUE-ACTUAL_VALUE < 0 ~ 0,
-                                                                      TRUE ~ NEW_VALUE-ACTUAL_VALUE),
-                                               ADJ_DIFFERENCE = (DIFFERENCE/sum(DIFFERENCE))*amount,
-                                               BUY_SHARES = floor(ADJ_DIFFERENCE/CURRENT_PRICE)) %>%
-                                        select(ASSET, BUY_SHARES))
-        
-        textList <- list()
-        for(i in 1:length(unique(contrAllo$ASSET))){
-          asset <- contrAllo %>%
-            subset(ASSET == unique(contrAllo$ASSET)[i])
-          
-          action <- ifelse(asset$BUY_SHARES > 0, 
-                           paste0("Buy ", asset$BUY_SHARES, " shares of ",
-                                  asset$ASSET, "."),
-                           paste0("No contributions into ", asset$ASSET,
-                                  " at this time."))
-          
-          textList[[i]] <- action
-        }
-        
-        HTML(renderMarkdown(text = paste("- ", textList, collapse = "\n")))
-        
-      } else {
-        accountDat <- portfolioSummary %>%
-          subset(ACCOUNT == account)
-        
-        targetTotal <- amount+sum(accountDat$ACTUAL_VALUE)
-        
-        contrAllo <- suppressMessages(accountDat %>%
-                                        left_join(assetPrices) %>%
-                                        mutate(NEW_VALUE = targetTotal*TARGET,
-                                               DIFFERENCE = case_when(NEW_VALUE-ACTUAL_VALUE < 0 ~ 0,
-                                                                      TRUE ~ NEW_VALUE-ACTUAL_VALUE),
-                                               ADJ_DIFFERENCE = (DIFFERENCE/sum(DIFFERENCE))*amount,
-                                               BUY_SHARES = floor(ADJ_DIFFERENCE/CURRENT_PRICE)) %>%
-                                        select(ASSET, BUY_SHARES))
-        
-        textList <- list()
-        for(i in 1:length(unique(contrAllo$ASSET))){
-          asset <- contrAllo %>%
-            subset(ASSET == unique(contrAllo$ASSET)[i])
-          
-          action <- ifelse(asset$BUY_SHARES > 0, 
-                           paste0("Buy ", asset$BUY_SHARES, " shares of ",
-                                  asset$ASSET, "."),
-                           paste0("No contributions into ", asset$ASSET,
-                                  " at this time."))
-          
-          textList[[i]] <- action
-        }
-        
-        HTML(renderMarkdown(text = paste("- ", textList, collapse = "\n")))
+        text_list[[i]] <- action
       }
       
+      HTML(renderMarkdown(text = paste("- ", text_list, collapse = "\n")))
+      
     })
   })
   
-  observe(displayText())
+  observe(displayText1())
   
-  asset <- reactive(input$enterAsset)
-  shares <- reactive(input$enterShares)
-  price <- reactive(input$enterPrice)
-  
-  addingShares <- eventReactive(input$addShare,{
-    
-    data <- read_csv("FinancialActivity.csv") %>%
-      mutate(COST = round(AMOUNT*PRICE, digits = 2)) %>%
-      mutate(DATE = as.Date(DATE, format = "%m/%d/%Y"))
-    
-    newRow <- cbind.data.frame(DATE = Sys.Date(),
-                               ACCOUNT = acct(),
-                               ASSET = asset(),
-                               AMOUNT = shares(),
-                               PRICE = price(),
-                               COST = shares()*price())
-    
-    data <- data %>%
-      bind_rows(newRow)
-    
-    output$saveData <- renderUI({input$addShare;
-      HTML(paste0("Purchased ", shares(), " shares of ", asset(), " for $", price(),"."))
+  displayText2 <- eventReactive(input$rebalance, {
+    output$rebalMessage1 <- renderUI({input$rebalance;
+      account <- acct()
+      
+      HTML(paste0("<b>Calculating a rebalance for ", account, "...</b>"))
     })
     
-    write.csv(data, "FinancialActivity.csv", row.names = F)
+    output$rebalMessage2 <- renderUI({input$rebalance;
+      account <- acct()
+      
+      calcData <- fullSummary %>%
+        filter(ACCOUNT == input$account)
+      
+      sellData <- calcData %>%
+        filter(REBALANCE < 0) %>%
+        mutate(REBALANCE = -1*REBALANCE) %>%
+        select(FUND, REBALANCE)
+      
+      buyData <- calcData %>%
+        filter(REBALANCE > 0) %>%
+        select(FUND, REBALANCE)
+      
+      sellText_list <- list()
+      if (nrow(sellData) > 0){
+        for(i in 1:length(unique(sellData$FUND))){
+          fund <- sellData %>%
+            filter(FUND == unique(sellData$FUND)[i])
+          
+          action <- paste0("Sell ", fund$REBALANCE, " shares of ",
+                           fund$FUND, ".")
+          
+          sellText_list[[i]] <- action
+        }
+      } else {
+        sellText_list <- list()
+      }
+      
+      buyText_list <- list()
+      if (nrow(buyData) > 0){
+        for(i in 1:length(unique(buyData$FUND))){
+          fund <- buyData %>%
+            filter(FUND == unique(buyData$FUND)[i])
+          
+          action <- paste0("Buy ", fund$REBALANCE, " shares of ",
+                           fund$FUND, ".")
+          
+          buyText_list[[i]] <- action
+        } 
+      } else {
+        buyText_list <- list()
+      }
+      
+      fullText_list <- c(sellText_list, buyText_list)
+      
+      HTML(renderMarkdown(text = paste("- ", fullText_list, collapse = "\n")))
+      
+    })
+    
+    output$rebalMessage3 <- renderUI({input$rebalance;
+      account <- acct()
+      
+      calcData <- fullSummary %>%
+        filter(ACCOUNT == input$account)
+      
+      maxOver <- calcData$MARKET_VAL[calcData$REL_DEV == max(calcData$REL_DEV)]
+      targetOver <- calcData$TARGET[calcData$REL_DEV == max(calcData$REL_DEV)]
+      acctValNeeded <- maxOver/targetOver
+      
+      contrNeeded <- calcData %>%
+        mutate(NEEDED_VAL = acctValNeeded*TARGET,
+               CONTR_DEV = floor((MARKET_VAL-NEEDED_VAL)/CURRENT_PRICE)*CURRENT_PRICE)
+      
+      valNeeded <- paste0("$",
+                          prettyNum(round(-1*sum(contrNeeded$CONTR_DEV), 
+                                          digits = 0), big.mark = ","))
+      
+      HTML(paste0("A ", valNeeded, " contribution is required to rebalance ",
+                  account, " without selling shares."))
+      
+    })
   })
   
-  observe(addingShares())
-  
-  output$acctSumm <- renderUI({
-    accountDat <- bind_rows(portfolioSummary, fullSummary) %>%
-      subset(ACCOUNT == input$account)
-    
-    currentVal <- sum(accountDat$ACTUAL_VALUE)
-    
-    costBasis <- sum(accountDat$COST_BASIS)
-    
-    currentReturn <- round((currentVal-costBasis)/costBasis*100, digits = 2)
-    
-    evalReturn <- ifelse(currentReturn > 0, "up", "down")
-    
-    HTML(paste0("Current ", 
-                input$account, 
-                " market value is $", 
-                prettyNum(currentVal, big.mark = ","),
-                ", ", evalReturn, " ", 
-                currentReturn, "%",
-                " from your cost basis of $",
-                prettyNum(costBasis, big.mark = ","),"."))
-  })
-  
-  output$acctRebalance <- renderUI({
-    accountDat <- bind_rows(portfolioSummary, fullSummary) %>%
-      subset(ACCOUNT == input$account)
-    
-    currentVal <- sum(accountDat$ACTUAL_VALUE)
-    
-    costBasis <- sum(accountDat$COST_BASIS)
-    
-    currentReturn <- round((currentVal-costBasis)/costBasis*100, digits = 2)
-    
-    evalReturn <- ifelse(currentReturn > 0, "up", "down")
-    
-    textList <- list()
-    for(i in 1:length(unique(accountDat$ASSET))){
-      asset <- suppressMessages(accountDat %>%
-                                  subset(ASSET == unique(accountDat$ASSET)[i]) %>%
-                                  mutate(REBALANCE = case_when(DEVIATION > .05 ~ (ACTUAL_VALUE - (ACTUAL_VALUE-(ACTUAL_VALUE*.025))),
-                                                               TRUE ~ 0)) %>%
-                                  left_join(assetPrices))
-      
-      evalDev <- ifelse(asset$DEVIATION > 0, "up", "down")
-      
-      evalBalance <- ifelse(asset$DEVIATION > .05,
-                            paste0("Recommend selling of ",
-                                   floor(asset$REBALANCE/asset$CURRENT_PRICE), " ",
-                                   "shares."),
-                            "No rebalance necessary at this time.")
-      
-      textList[[i]] <-  paste0(asset$ASSET, " is currently ",
-                               round(asset$ACTUAL*100, digits = 2), "% of the account, ",
-                               evalDev, " ", round(asset$DEVIATION*100, digits = 2), "%",
-                               " from the target of ",
-                               round(asset$TARGET*100, digits = 2), "%. ",
-                               evalBalance)
-    }
-    
-    HTML(renderMarkdown(text = paste("- ", textList, collapse = "\n")))
-    
-  })
-  
+  observe(displayText2())
 }
 
 shinyApp(ui = ui, server = server)

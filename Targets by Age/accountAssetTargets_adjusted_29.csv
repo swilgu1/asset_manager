@@ -1,0 +1,5 @@
+"ACCOUNT","FUND","TYPE","ASSET","TARGET"
+"401(k)","AVUS","US Equities","US Large Blend",0.25
+"401(k)","AVUV","US Equities","US Small Value",0.25
+"401(k)","AVDV","Intl Equities","Intl Small Value",0.25
+"401(k)","AVES","Emerging Markets","Emerging Markets",0.25
